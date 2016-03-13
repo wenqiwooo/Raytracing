@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script src="gpu.js"></script>
+  </head>
+  <body>
+    <div id="fps"></div>
+    <script>
+      var selection = 0;
+
+      var fps = { startTime : 0, frameNumber : 0,
+        getFPS : function() {
+          this.frameNumber++;
+          var d = new Date().getTime(), currentTime = ( d - this.startTime ) / 1000, result = Math.floor( ( this.frameNumber / currentTime ) );
+          if( currentTime > 1 ) {
+            this.startTime = new Date().getTime();
+            this.frameNumber = 0;
+          }
+          return result;
+        }
+      };
+
+
+      function Enum(constantsList) {
+        for (var i in constantsList) {
+          this[constantsList[i]] = i;
+        }
+      }
+
+      var ObjTyp = new Enum(['EMPTY', 'SPHERE', 'CUBOID', 'CYLINDER', 'CONE', 'TRIANGLE']);
+
+      var camera = [
+        400,200,-400,              // x,y,z 
+        0,0,1,                     // Direction normal 
+        45                         // field of view : example 45
+      ];
+
+      var lights = [
+        2,                                                                                     
+        800,200,600, 1,1,1,        // light 1, x,y,z location, and rgb 
+        800,200,600, 1,1,1          // light 2, x,y,z location, and rgb 
+      ];
+
+      var objects = [
+        3, // number of objects                               
+        ObjTyp.SPHERE,      13, 1.0, 0.0, 0.0, 0.2, 0.7, 0.1, 1.0, 400, 200, 400, 100,           
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad           
+        ObjTyp.SPHERE,      13, 0.0, 0.0, 1.0, 0.2, 0.7, 0.1, 1.0, 725, 200, 400, 50,            
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad
+        ObjTyp.SPHERE,      13, 0.0, 1.0, 0.0, 0.2, 0.7, 0.1, 1.0, 600, 350, 400, 30,         
+      ];
+
+      function sqr(x){
+        return x*x;
+      }
+
+      function dist(x1,y1,x2,y2){
+        return Math.sqrt(sqr(x2-x1)+sqr(y2-y1));
+      }
+
+      function vectorMag(x, y, z){
+        return Math.sqrt(Math.pow(x,2) + Math.pow(y,2) + Math.pow(z,2));
+      }
+
+      var gpu = new GPU();
+
+      gpu.addFunction(sqr);
+      gpu.addFunction(dist);
+      gpu.addFunction(vectorMag);
+
+      function doit(mode){
+        var opt = {
+          dimensions: [800, 400],
+          debug: true,
+          graphical: true,
+          safeTextureReadHack: false,
+          constants: { OBJCOUNT: objects[0],
+                        LIGHTCOUNT: lights[0],
+                        WIDTH: 800,
+                        HEIGHT: 400,     
+                        EMPTY: ObjTyp.EMPTY,    
+                        SPHERE: ObjTyp.SPHERE,   
+                        CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   
+                        CONE: ObjTyp.CONE,   
+                        TRIANGLE: ObjTyp.TRIANGLE },
+          mode: "auto"
+        };
+
+        var kObj = gpu.createKernel(function(Camera, Lights, Objects) {
+          this.color(0.05,0.05,0.15); 
+          //this.color(0.95,0.95,0.95); 
+
+          var idx = 1;                                      // index for looking through all the objects
+          var nextidx = 1;                          
+          var nearestObjectDist = 1000000000;
+          var cX = Camera[0];
+          var cY = Camera[1];
+          var cZ = Camera[2];
+
+          // Consider only normal vector for camera first
+          var cNormX = Camera[3];
+          var cNormY = Camera[4];
+          var cNormZ = Camera[5];
+          // FOV in radians
+          var cFov = 3.1415 * (Camera[6]/360);
+          var aspect = this.constants.WIDTH/this.constants.HEIGHT;
+          var halfHeight = Math.tan(cFov);
+          var halfWidth = aspect * halfHeight;
+          var cWidth = halfWidth * 2;
+          var cHeight = halfHeight * 2;
+          var pixelWidth = cWidth/(this.constants.WIDTH - 1);
+          var pixelHeight = cHeight/(this.constants.HEIGHT - 1);
+
+          for (i = 0; i < this.constants.OBJCOUNT; i++){    // Look at all object records
+            idx = nextidx;                                  // Skip to next record
+            nextidx = Objects[idx+1]+idx;                   // Pre-compute the beginning of the next record
+            var d = -1;
+
+            var oColorR = Objects[idx+2];
+            var oColorG = Objects[idx+3];
+            var oColorB = Objects[idx+4];
+            var oX = Objects[idx+9];
+            var oY = Objects[idx+10];
+            var oZ = Objects[idx+11];
+            var oRad = Objects[idx+12];
+
+            var oLamb = Objects[idx+6];
+            var oAmb = Objects[idx+7];
+
+            var colorR = oAmb*oColorR;
+            var colorG = oAmb*oColorG;
+            var colorB = oAmb*oColorB;
+
+            var lineX = (this.thread.x * pixelWidth) - halfWidth;
+            var lineY = (this.thread.y * pixelHeight) - halfHeight;
+            var lineZ = cNormZ;
+
+            // Make direction vector into unit vector
+            var lineMag = vectorMag(lineX, lineY, lineZ);
+            lineX = lineX/lineMag;
+            lineY = lineY/lineMag;
+            lineZ = lineZ/lineMag;
+
+            // start point - center of sphere
+            var dX = cX - oX;
+            var dY = cY - oY;
+            var dZ = cZ - oZ;
+
+            var B = 2 * (lineX*dX + lineY*dY + lineZ*dZ);
+            var C = sqr(dX) + sqr(dY) + sqr(dZ) - sqr(oRad);
+            var D = sqr(B) - 4*C;
+              
+            if (D < 0){
+              d = -1
+            } else {
+              d = (-B - Math.sqrt(D))/2;
+              if (d < nearestObjectDist){
+                nearestObjectDist = d;
+                var intersectX = cX + d*lineX;
+                var intersectY = cY + d*lineY;
+                var intersectZ = cZ + d*lineZ;
+
+                // For reflection
+                var normalX = intersectX - oX;
+                var normalY = intersectY - oY;
+                var normalZ = intersectZ - oZ;
+                var normalMag = vectorMag(normalX, normalY, normalZ);
+                normalX = normalX/normalMag;
+                normalY = normalY/normalMag;
+                normalZ = normalZ/normalMag;
+
+                var index = 1;
+                var dIndex = 6;
+
+                for (j = 0; j < this.constants.LIGHTCOUNT; j++){
+                  var lightX = Lights[index];
+                  var lightY = Lights[index+1];
+                  var lightZ = Lights[index+2];
+                  var lightColorR = Lights[index+3];
+                  var lightColorG = Lights[index+4];
+                  var lightColorB = Lights[index+5];
+
+                  var pToLightX = intersectX - lightX;
+                  var pToLightY = intersectY - lightY;
+                  var pToLightZ = intersectZ - lightZ;
+                  var pToLightMag = vectorMag(pToLightX, pToLightY, pToLightZ);
+                  pToLightX = pToLightX/pToLightMag;
+                  pToLightY = pToLightY/pToLightMag;
+                  pToLightZ = pToLightZ/pToLightMag;
+                  var diffuse = oLamb*(normalX*pToLightX + normalY*pToLightY + normalZ*pToLightZ);
+
+                  var intersectMag = vectorMag(intersectX, intersectY, intersectZ);
+                  var dotPdt = (normalX*intersectX + normalY*intersectY + normalZ*intersectZ)/intersectMag;
+                  var angle = acos(dotPdt);
+                  var rightAngle = 3.1412/2;
+
+                  if (true){
+                    var kIdx = 1;
+                    var kNextIdx = 1;
+                    var isBlocked = 0;
+                    for (k = 0; k < this.constants.OBJCOUNT; k++){
+                      kIdx = kNextIdx;                                  
+                      kNextIdx = Objects[kIdx+1]+kIdx;
+                      var objX = Objects[kIdx+9];
+                      var objY = Objects[kIdx+10];
+                      var objZ = Objects[kIdx+11];
+                      var objRad = Objects[kIdx+12];
+
+                      // start point - center of sphere
+                      var lineX = intersectX - objX;
+                      var lineY = intersectY - objY;
+                      var lineZ = intersectZ - objZ;
+
+                      var B = 2 * (pToLightX*lineX + pToLightY*lineY + pToLightZ*lineZ);
+                      var C = sqr(lineX) + sqr(lineY) + sqr(lineZ) - sqr(objRad);
+                      var D = sqr(B) - 4*C;
+
+                      // if (D > 0){
+                      //   var d = (-B - Math.sqrt(D))/2;
+                      //   if (d < pToLightMag){
+                      //     isBlocked = 1;
+                      //   }
+                      // }
+                    }
+
+                    if (isBlocked == 0){
+                      colorR += diffuse*oColorR;
+                      colorG += diffuse*oColorG;
+                      colorB += diffuse*oColorB;
+                    }
+                    index += dIndex;
+                  }
+                }
+
+                this.color(colorR, colorG, colorB);
+              }
+            }
+
+          }
+
+        }, opt);
+        return kObj;
+      }
+
+      var mykernel = doit("gpu");
+      var mycode = doit("cpu");
+      mykernel(camera,lights,objects);
+      var canvas = mykernel.getCanvas();
+      document.getElementsByTagName('body')[0].appendChild(canvas);
+
+      var f = document.querySelector("#fps");
+      
+      var angle = 0;
+      var orbitRadius = 325;
+
+      function renderLoop() {
+        f.innerHTML = fps.getFPS();
+        if (selection === 0) {
+          mycode(camera,lights,objects);
+          var cv = document.getElementsByTagName("canvas")[0];
+          var bdy = cv.parentNode;
+          var newCanvas = mycode.getCanvas();
+          bdy.replaceChild(newCanvas, cv);
+        } else {
+          mykernel(camera,lights,objects);
+          var cv = document.getElementsByTagName("canvas")[0];
+          var bdy = cv.parentNode;
+          var newCanvas = mykernel.getCanvas();
+          bdy.replaceChild(newCanvas, cv);
+        }
+
+        // Change location of objects
+        angle+=1;
+        if (angle > 360){
+          angle = 0;
+        }
+        var angleRad = 3.1412 * (angle/180);
+        var z = 325 * Math.sin(angleRad);
+        var x = 325 * Math.cos(angleRad);
+
+        // x
+        objects[23] = 400 + x;
+        // z
+        objects[25] = 400 + z;
+
+  //      setTimeout(renderLoop,1);            // Uncomment this line, and comment the next line
+        requestAnimationFrame(renderLoop);     // to see how fast this could run...
+      }
+      window.onload = renderLoop;
+
+    </script>
+  </body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
