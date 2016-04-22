@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script src="gpu.js"></script>
+    <script src="functions.js"></script>
+  </head>
+  <body>
+    <div id="fps"></div>
+    <script>
+      var selection = 0;
+
+      var fps = { startTime : 0, frameNumber : 0,
+        getFPS : function() {
+          this.frameNumber++;
+          var d = new Date().getTime(), currentTime = ( d - this.startTime ) / 1000, result = Math.floor( ( this.frameNumber / currentTime ) );
+          if( currentTime > 1 ) {
+            this.startTime = new Date().getTime();
+            this.frameNumber = 0;
+          }
+          return result;
+        }
+      };
+
+      function Enum(constantsList) {
+        for (var i in constantsList) {
+          this[constantsList[i]] = i;
+        }
+      }
+
+      var ObjTyp = new Enum(['EMPTY', 'SPHERE', 'CUBOID', 'CYLINDER', 'CONE', 'TRIANGLE']);
+
+
+      var camera = [
+        0,1.8,15,              // x,y,z 
+        0,3,0,                     // Vector
+        45                         // field of view : example 45
+      ];
+
+      var lights = [
+        2,                                                                                
+        -30,-10,10, 1,1,1,        // light 1, x,y,z location, and rgb 
+        30,3,20, 1,1,1,        // light 2, x,y,z location, and rgb 
+      ];
+
+      var objects = [
+        4, // number of objects                               
+        ObjTyp.SPHERE,      13, 0.0,0.0,1.0,0.2,0.7,0.1,1.0, 0,3,-5,2,        
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad,            
+        ObjTyp.SPHERE,      13, 1.0,0.0,0.0,0.2,0.7,0.1,1.0, -4,2,-5,0.2,           
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad,           
+        ObjTyp.SPHERE,      13, 0.0,1.0,0.0,0.2,0.7,0.1,1.0, -3,3,-5,0.6,        
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad,
+        ObjTyp.SPHERE,      13, 1.0,1.0,0.0,0.2,0.7,0.1,1.0, 0,13,-10,0.1        
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad,       
+      ];
+
+      var gpu = new GPU();
+
+		  gpu.addFunction(sqr);
+		  gpu.addFunction(dist);
+      gpu.addFunction(magVector);
+      gpu.addFunction(intersectBB);
+
+      function prepare(mode){
+        var opt = {
+          dimensions: [objects[0] * 6 + 1],
+          debug: true,
+          graphical: false,
+          constants: { OBJCOUNT: objects[0],  
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        var preprocess = gpu.createKernel(function(objects){
+          if (this.thread.x == 0){
+            return objects[0];
+          }
+
+          // 6 features: min_x, min_y, min_z, max_x, max_y, max_z
+          var idx = (Math.floor((this.thread.x - 1) / 6)) * 13 + 1;
+          var k = (this.thread.x - 1) % 6;
+          if (k == 0){
+            // Find x
+            return objects[idx+9] - objects[idx+12];
+          } else if (k == 1){
+            // Find y
+            return objects[idx+10] - objects[idx+12];
+          } else if (k == 2){
+            // Find z
+            return objects[idx+11] - objects[idx+12];
+          } else if (k == 3){
+            // Find wid
+            return objects[idx+9] + objects[idx+12];
+          } else if (k == 4){
+            // Find hgt
+            return objects[idx+10] + objects[idx+12];
+          } else if (k == 5){
+            // Find dep
+            return objects[idx+11] + objects[idx+12];
+          } 
+        }, opt);
+        return preprocess;
+      }
+
+      // get bounding boxes
+      var mykernel = prepare("gpu");
+      var bboxes = mykernel(objects);
+
+      // get the pixels that intersect with bounding boxes
+      function findIntersectedBB(mode){
+        var opt = {
+          dimensions: [400,200],
+          debug: true,
+          graphical: true,
+          safeTextureReadHack: false,
+          constants: { OBJCOUNT: objects[0],
+                        WIDTH: 400, HEIGHT: 200, 
+                        INFINITY: 100000000,   
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        // ObjTyp.SPHERE attributes
+        // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad, 
+        var findPixels = gpu.createKernel(function(camera, bboxes){
+          this.color(0.95, 0.95, 0.95);
+
+          var camera_x = camera[0];
+          var camera_y = camera[1];
+          var camera_z = camera[2];
+          var cameraVector_x = camera[3];
+          var cameraVector_y = camera[4];
+          var cameraVector_z = camera[5];
+          var cameraFov = camera[6];
+
+          // Eye vector
+          var eyeVector_x = cameraVector_x - camera_x;
+          var eyeVector_y = cameraVector_y - camera_y;
+          var eyeVector_z = cameraVector_z - camera_z;
+          var eyeVector_size = magVector(eyeVector_x, eyeVector_y, eyeVector_z);
+          eyeVector_x = eyeVector_x / eyeVector_size;
+          eyeVector_y = eyeVector_y / eyeVector_size;
+          eyeVector_z = eyeVector_z / eyeVector_size;
+
+          // Cross product
+          // x: (a.y * b.z) - (a.z * b.y)
+          // y: (a.z * b.x) - (a.x * b.z)
+          // z: (a.x * b.y) - (a.y * b.x)
+          var vpRight_x = eyeVector_y*0 - eyeVector_z*1;
+          var vpRight_y = eyeVector_z*0 - eyeVector_x*0;
+          var vpRight_z = eyeVector_x*1 - eyeVector_y*0;
+          var vpRight_size = magVector(vpRight_x, vpRight_y, vpRight_z);
+          vpRight_x = vpRight_x / vpRight_size;
+          vpRight_y = vpRight_y / vpRight_size;
+          vpRight_z = vpRight_z / vpRight_size;
+
+          var vpUp_x = vpRight_y*eyeVector_z - vpRight_z*eyeVector_y;
+          var vpUp_y = vpRight_z*eyeVector_x - vpRight_x*eyeVector_z;
+          var vpUp_z = vpRight_x*eyeVector_y - vpRight_y*eyeVector_x;
+          var vpUp_size = magVector(vpUp_x, vpUp_y, vpUp_z);
+          vpUp_x = vpUp_x / vpUp_size;
+          vpUp_y = vpUp_y / vpUp_size;
+          vpUp_z = vpUp_z / vpUp_size;
+
+          var fovRadians = 3.142 * (cameraFov / 2) / 180;
+          var heightWidthRatio = this.constants.HEIGHT / this.constants.WIDTH;
+          var halfWidth = Math.tan(fovRadians);
+          var halfHeight = heightWidthRatio * halfWidth;
+          var cameraWidth = halfWidth * 2;
+          var cameraHeight = halfHeight * 2;
+          var pixelWidth = cameraWidth / (this.constants.WIDTH - 1);
+          var pixelHeight = cameraHeight / (this.constants.HEIGHT - 1);
+
+          var xcomp_scale = (this.thread.x * pixelWidth) - halfWidth;
+          var xcomp_x = vpRight_x * xcomp_scale;
+          var xcomp_y = vpRight_y * xcomp_scale;
+          var xcomp_z = vpRight_z * xcomp_scale;
+
+          var ycomp_scale = (this.thread.y * pixelHeight) - halfHeight;
+          var ycomp_x = vpUp_x * ycomp_scale;
+          var ycomp_y = vpUp_y * ycomp_scale;
+          var ycomp_z = vpUp_z * ycomp_scale;
+
+          var rayVect_x = eyeVector_x + xcomp_x + ycomp_x;
+          var rayVect_y = eyeVector_y + xcomp_y + ycomp_y;
+          var rayVect_z = eyeVector_z + xcomp_z + ycomp_z;
+          var rayVect_size = magVector(rayVect_x, rayVect_y, rayVect_z);
+          rayVect_x = rayVect_x / rayVect_size;
+          rayVect_y = rayVect_y / rayVect_size;
+          rayVect_z = rayVect_z / rayVect_size;
+
+          var rayPt_x = camera_x;
+          var rayPt_y = camera_y;
+          var rayPt_z = camera_z;
+
+          var idx = 1;                                   
+          var nextidx = 1;  
+          var idxInc = 6;
+          // for each bounding box                 
+          // min_x, min_y, min_z, max_x, max_y, max_z
+          for (i = 0; i < this.constants.OBJCOUNT; i++) {    
+            idx = nextidx;                               
+            nextidx = idx + idxInc;
+            var bb_min_x = bboxes[idx];
+            var bb_min_y = bboxes[idx + 1];
+            var bb_min_z = bboxes[idx + 2];
+            var bb_max_x = bboxes[idx + 3];
+            var bb_max_y = bboxes[idx + 4];
+            var bb_max_z = bboxes[idx + 5];
+
+            var isIntersect = intersectBB(rayPt_x, rayPt_y, rayPt_z, rayVect_x, rayVect_y, rayVect_z, bb_min_x, bb_min_y, bb_min_z, bb_max_x, bb_max_y, bb_max_z);
+            if (isIntersect == 1){
+              //return 1;
+              this.color(1, 0, 0);
+            }
+          }
+
+          //return 0;
+        }, opt);
+        
+        return findPixels;
+      }
+
+      // get intersected bounding boxes
+      mykernel = findIntersectedBB("gpu");
+      mykernel(camera, bboxes);
+      //var onPixels = mykernel(camera, bboxes);
+      // generate array containing locations of active pixels
+      // var pixArray = getOnPixels(onPixels);
+      var canvas = mykernel.getCanvas();
+      document.getElementsByTagName('body')[0].appendChild(canvas);
+
+      // only process colour of active pixels      
+
+    </script>
+  </body>
+</html>
+
+
+
+
+
+
+

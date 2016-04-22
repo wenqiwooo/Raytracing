@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script src="gpu.js"></script>
+    <script src="functions.js"></script>
+    <!-- Objects, lights and camera data are declared in setup.js -->
+    <script src="setup.js"></script>
+  </head>
+  <body>
+    <div id="fps"></div>
+    <script>
+      // -------------------- Declaration -----------------------
+      // Mode to run kernel functions in
+      const mode = "cpu";
+      // Width and height of viewing plane in pixels
+      const width = 800;
+      const height = 400;
+      // Width and height of view box in pixels
+      const unitWidth = 20;
+      const unitHeight = 20;
+      // Background color for canvas
+      const bgColorR = 0.95;
+      const bgColorG = 0.95;
+      const bgColorB = 0.95;
+      // Number of rows and columns of view boxes in the viewing plane
+      const viewBoxRow_len = width / unitWidth;
+      const viewBoxCol_len = height / unitHeight;
+
+      // -------------- GPU INITIALIZATION ----------------------
+      // Create instance of GPU and add functions to it
+      var gpu = new GPU();
+		  gpu.addFunction(sqr);
+		  gpu.addFunction(dist);
+      gpu.addFunction(magVector);
+      gpu.addFunction(intersectBB);
+      gpu.addFunction(getScalingForZDepth);
+      gpu.addFunction(checkOverlappingSquares);
+      gpu.addFunction(colorRgbToInt);
+      gpu.addFunction(getPixelCoord_x);
+      gpu.addFunction(getPixelCoord_y);
+      gpu.addFunction(getColorHueFromInt);
+
+      // ------------ GET AXIS-ALIGNED BOUNDING BOXES ------------
+      // This function is used to generate a bounding box for each of the objects.
+      // The 6 features of a bounding box are min_x, min_y, min_z, max_x, max_y, max_z.
+      // A thread will be created to evaluate each feature of an object, i.e. each object will have 6 threads.
+      // There will be an additional thread created to return the number of objects
+      function prepare(mode){
+        var opt = {
+          dimensions: [objects[0] * 6 + 1],
+          debug: true,
+          graphical: false,
+          constants: { OBJCOUNT: objects[0],  
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        var preprocess = gpu.createKernel(function(objects){
+          if (this.thread.x == 0){
+            return objects[0];
+          }
+
+          var idx = (Math.floor((this.thread.x - 1) / 6)) * 13 + 1;
+          var k = (this.thread.x - 1) % 6;
+          if (k == 0){            // Find min_x
+            return objects[idx+9] - objects[idx+12];
+          } else if (k == 1){     // Find min_y
+            return objects[idx+10] - objects[idx+12];
+          } else if (k == 2){     // Find min_z
+            return objects[idx+11] - objects[idx+12];
+          } else if (k == 3){     // Find max_x
+            return objects[idx+9] + objects[idx+12];
+          } else if (k == 4){     // Find max_y
+            return objects[idx+10] + objects[idx+12];
+          } else if (k == 5){     // Find max_z
+            return objects[idx+11] + objects[idx+12];
+          } 
+        }, opt);
+        return preprocess;
+      }
+
+      // --------------- GET ACTIVE VIEW BOXES -------------------
+      // This function determines if a view box overlaps with any bounding boxes, i.e.
+      // the bounding box can be observed through the view box from the camera.
+      // A thread is created for each view box.
+      // If there is an overlap, the thread for that view box will return 1.
+      // The consolidated result will be a 2D array, with indexes corresponding 
+      // to the coordinates of the view boxes in the viewing plane.
+      // If result[a][b] == 1, then the view box with at (a,b) overlaps with at least one bounding box.
+      // Note: Coordinates here do not refer to the actual pixel coordinates, 
+      // but the position of the view box relative to other view boxes in the viewing plane.
+      function getActiveViewBoxes(mode){
+        var opt = {
+          dimensions: [viewBoxRow_len, viewBoxCol_len],
+          debug: true,
+          graphical: false,
+          safeTextureReadHack: false,
+          constants: { BBOXCOUNT: objects[0],
+                        WIDTH: width, HEIGHT: height,
+                        UNITWIDTH: unitWidth, UNITHEIGHT: unitHeight, 
+                        INFINITY: 100000000,   
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        // bboxes contains the array of axis-aligned bounding boxes evaluated earlier.
+        var getActiveViewBoxesKernel = gpu.createKernel(function(camera, bboxes){
+
+          var camera_x = camera[0];
+          var camera_y = camera[1];
+          var camera_z = camera[2];
+          var cameraVector_x = camera[3];
+          var cameraVector_y = camera[4];
+          var cameraVector_z = camera[5];
+          var cameraFov = camera[6];
+
+          // Get the eye vector
+          var eyeVector_x = cameraVector_x - camera_x;
+          var eyeVector_y = cameraVector_y - camera_y;
+          var eyeVector_z = cameraVector_z - camera_z;
+          var eyeVector_size = magVector(eyeVector_x, eyeVector_y, eyeVector_z);
+          eyeVector_x = eyeVector_x / eyeVector_size;
+          eyeVector_y = eyeVector_y / eyeVector_size;
+          eyeVector_z = eyeVector_z / eyeVector_size;
+
+          // Formula for cross product
+          // x: (a.y * b.z) - (a.z * b.y)
+          // y: (a.z * b.x) - (a.x * b.z)
+          // z: (a.x * b.y) - (a.y * b.x)
+          var vpRight_x = eyeVector_y*0 - eyeVector_z*1;
+          var vpRight_y = eyeVector_z*0 - eyeVector_x*0;
+          var vpRight_z = eyeVector_x*1 - eyeVector_y*0;
+          var vpRight_size = magVector(vpRight_x, vpRight_y, vpRight_z);
+          vpRight_x = vpRight_x / vpRight_size;
+          vpRight_y = vpRight_y / vpRight_size;
+          vpRight_z = vpRight_z / vpRight_size;
+
+          var vpUp_x = vpRight_y*eyeVector_z - vpRight_z*eyeVector_y;
+          var vpUp_y = vpRight_z*eyeVector_x - vpRight_x*eyeVector_z;
+          var vpUp_z = vpRight_x*eyeVector_y - vpRight_y*eyeVector_x;
+          var vpUp_size = magVector(vpUp_x, vpUp_y, vpUp_z);
+          vpUp_x = vpUp_x / vpUp_size;
+          vpUp_y = vpUp_y / vpUp_size;
+          vpUp_z = vpUp_z / vpUp_size;
+
+          var fovRadians = 3.142 * (cameraFov / 2) / 180;
+          var heightWidthRatio = this.constants.HEIGHT / this.constants.WIDTH;
+          var halfWidth = Math.tan(fovRadians);
+          var halfHeight = heightWidthRatio * halfWidth;
+          var cameraWidth = halfWidth * 2;
+          var cameraHeight = halfHeight * 2;
+          var pixelWidth = cameraWidth / (this.constants.WIDTH - 1);
+          var pixelHeight = cameraHeight / (this.constants.HEIGHT - 1);
+
+          // All bounding boxes evaluated are axis aligned, i.e. 
+          // the edges of the box are aligned with the x, y and z coordinate axes of the scene. 
+          // This enables us to reduce the problem of determining whether the bounding box overlaps 
+          // with the view box scene in 3D space into the problem of determining whether two rectangles 
+          // overlap in two dimensional space. This is much less expensive computationally.
+
+          // To check if the bounding box overlaps with the view box scene, 
+          // we can check for overlaps between the xy-planes of the bounding box with the 
+          // planes of the view box scene at similar depth. 
+          // If there is at least one overlap, 
+          // we can conclude that the bounding box will be observed through the view box.
+
+          // Get the smallest and largest x and y pixel coordinates of the view box
+          var x0 = this.thread.x * this.constants.UNITWIDTH;
+          var y0 = this.thread.y * this.constants.UNITHEIGHT;
+          var x1 = (this.thread.x + 1) * this.constants.UNITWIDTH - 1;
+          var y1 = (this.thread.y + 1) * this.constants.UNITHEIGHT - 1;
+
+          // Get the ray direction vector of the samllest pixel coordinate, i.e. (x0,y0)
+          var xcomp0_scale = (x0 * pixelWidth) - halfWidth;
+          var xcomp0_x = vpRight_x * xcomp0_scale;
+          var xcomp0_y = vpRight_y * xcomp0_scale;
+          var xcomp0_z = vpRight_z * xcomp0_scale;
+
+          var ycomp0_scale = (y0 * pixelHeight) - halfHeight;
+          var ycomp0_x = vpUp_x * ycomp0_scale;
+          var ycomp0_y = vpUp_y * ycomp0_scale;
+          var ycomp0_z = vpUp_z * ycomp0_scale;
+
+          var rayVect0_x = eyeVector_x + xcomp0_x + ycomp0_x;
+          var rayVect0_y = eyeVector_y + xcomp0_y + ycomp0_y;
+          var rayVect0_z = eyeVector_z + xcomp0_z + ycomp0_z;
+          var rayVect0_size = magVector(rayVect0_x, rayVect0_y, rayVect0_z);
+          rayVect0_x = rayVect0_x / rayVect0_size;
+          rayVect0_y = rayVect0_y / rayVect0_size;
+          rayVect0_z = rayVect0_z / rayVect0_size;
+
+          // Get the ray direction vector of the largest pixel coordinate, i.e. (x1,y1)
+          var xcomp1_scale = (x1 * pixelWidth) - halfWidth;
+          var xcomp1_x = vpRight_x * xcomp1_scale;
+          var xcomp1_y = vpRight_y * xcomp1_scale;
+          var xcomp1_z = vpRight_z * xcomp1_scale;
+
+          var ycomp1_scale = (y1 * pixelHeight) - halfHeight;
+          var ycomp1_x = vpUp_x * ycomp1_scale;
+          var ycomp1_y = vpUp_y * ycomp1_scale;
+          var ycomp1_z = vpUp_z * ycomp1_scale;
+
+          var rayVect1_x = eyeVector_x + xcomp1_x + ycomp1_x;
+          var rayVect1_y = eyeVector_y + xcomp1_y + ycomp1_y;
+          var rayVect1_z = eyeVector_z + xcomp1_z + ycomp1_z;
+          var rayVect1_size = magVector(rayVect1_x, rayVect1_y, rayVect1_z);
+          rayVect1_x = rayVect1_x / rayVect1_size;
+          rayVect1_y = rayVect1_y / rayVect1_size;
+          rayVect1_z = rayVect1_z / rayVect1_size;
+
+          // Get the ray origin. 
+          // Both direction vectors share the same origin point, i.e. camera point.
+          var rayPt_x = camera_x;
+          var rayPt_y = camera_y;
+          var rayPt_z = camera_z;
+
+          // Indexes for traversing through bboxes array
+          var idx = 1;                                   
+          var nextidx = 1;  
+          var idxInc = 6;
+
+          for (i = 0; i < this.constants.BBOXCOUNT; i++) {    
+            idx = nextidx;                               
+            nextidx = idx + idxInc;
+            var bb_min_x = bboxes[idx];
+            var bb_min_y = bboxes[idx + 1];
+            var bb_min_z = bboxes[idx + 2];
+            var bb_max_x = bboxes[idx + 3];
+            var bb_max_y = bboxes[idx + 4];
+            var bb_max_z = bboxes[idx + 5];
+
+            // For both the smallest and largest coordinates of the bounding box,
+            // i.e. (bb_min_x, bb_min_y, bb_min_z) and (bb_max_x, bb_max_y, bb_max_z),
+            // we can check if the bounding box overlaps with the view box scene 
+            // by checking if the xy-planes of the boundary box overlaps with the 
+            // plane of the view box scene at similar depths.
+            // Since the boundary box is axis-aligned, 
+            // we can assume the shallowest and deepest depth of the bounding box 
+            // to be bb_min_z and bb_max_z respectively.
+            
+            var coord0_min_scale = getScalingForZDepth(rayPt_z, rayVect0_z, bb_min_z);
+            var coord0_min_x = rayPt_x + coord0_min_scale * rayVect0_x;
+            var coord0_min_y = rayPt_y + coord0_min_scale * rayVect0_y;
+            var coord0_max_scale = getScalingForZDepth(rayPt_z, rayVect0_z, bb_max_z);
+            var coord0_max_x = rayPt_x + coord0_max_scale * rayVect0_x;
+            var coord0_max_y = rayPt_y + coord0_max_scale * rayVect0_y;
+
+            var coord1_min_scale = getScalingForZDepth(rayPt_z, rayVect1_z, bb_min_z);
+            var coord1_min_x = rayPt_x + coord1_min_scale * rayVect1_x;
+            var coord1_min_y = rayPt_y + coord1_min_scale * rayVect1_y;
+            var coord1_max_scale = getScalingForZDepth(rayPt_z, rayVect1_z, bb_max_z);
+            var coord1_max_x = rayPt_x + coord1_max_scale * rayVect1_x;
+            var coord1_max_y = rayPt_y + coord1_max_scale * rayVect1_y;
+
+            var isOverlapping = checkOverlappingSquares(bb_min_x, bb_min_y, bb_max_x, bb_max_y, 
+                                                        coord0_min_x, coord0_min_y, coord0_max_x, coord0_max_y, 
+                                                        coord1_min_x, coord1_min_y, coord1_max_x, coord1_max_y);
+            
+            // If overlaps, return 1
+            if (isOverlapping == 1){
+              return 1;
+            }
+          }
+          // If no bounding box overlaps with view box scene, return 0
+          return 0;
+        }, opt);
+
+        return getActiveViewBoxesKernel;
+      }
+
+      // ---------------- DRAW PIXEL COLOR MAP ------------------------
+      // This function takes in the colour of all pixels as a 2D array and draws them onto a canvas.
+      // A thread is created for each pixel.
+      function drawPixelColorMap(mode){
+        var opt = {
+          dimensions: [width, height],
+          debug: true,
+          graphical: true,
+          safeTextureReadHack: false,
+          constants: { OBJCOUNT: objects[0],
+                        WIDTH: width, HEIGHT: height, 
+                        INFINITY: 100000000,
+                        UNITWIDTH: unitWidth, UNITHEIGHT: unitHeight,    
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        var drawPixelColorMapKernel = gpu.createKernel(function(pixelColorMap){
+          var colorR = getColorHueFromInt(pixelColorMap[this.thread.x][this.thread.y], 0) / 255;
+          var colorG = getColorHueFromInt(pixelColorMap[this.thread.x][this.thread.y], 1) / 255;
+          var colorB = getColorHueFromInt(pixelColorMap[this.thread.x][this.thread.y], 2) / 255;
+          this.color(colorR, colorG, colorB);
+        }, opt);
+
+        return drawPixelColorMapKernel;
+      }
+
+
+      var f = document.querySelector("#fps");
+      var angle = 0;
+
+      // ------------------------- ANIMATION ---------------------------
+      // renderLoop contains the instructions to generate a single frame.
+      // It is repeatedly called to generate a series of frames, 
+      // that is displayed one after the other other.
+      function renderLoop() {
+        f.innerHTML = fps.getFPS();
+
+        // Timer
+        // var timerStart = Date.now();
+
+        // Get bounding boxes for all objects
+        var mykernel = prepare(mode);
+        var bboxes = mykernel(objects);
+
+        // Get active view boxes
+        mykernel = getActiveViewBoxes(mode);
+        var vBoxes = mykernel(camera, bboxes);
+        var activeVBoxes = getActiveVBoxesCoord(vBoxes);
+
+        // Initialize pixel color map
+        // All pixel colors will be set to the background color initially.
+        // Later on, we will update the colors for pixels which contain objects.
+        var pixelColorMap = [];
+        for (var i = 0; i < width; i++){
+          pixelColorMap[i] = [];
+          for (var j = 0; j < height; j++){
+            pixelColorMap[i][j] = colorRgbToInt(bgColorR, bgColorG, bgColorB);
+          }
+        }
+
+        // ---------------------- RAYTRACING ------------------------
+        // This function does all the raytracing from each pixel for all active view boxes.
+        // A thread is created for each pixel.
+        // Since the number of active view boxes changes each frame, 
+        // this function has to be redeclared during every iteration of renderLoop.
+        function doit(mode){
+          var opt = {
+            dimensions: [unitWidth * activeVBoxes.length, unitHeight],
+            debug: true,
+            graphical: false,
+            safeTextureReadHack: false,
+            constants: { OBJCOUNT: objects[0],
+                          LIGHTCOUNT: lights[0],
+                          WIDTH: width, HEIGHT: height,
+                          UNITWIDTH: unitWidth, UNITHEIGHT: unitHeight, 
+                          DEPTH: 3,
+                          INFINITY: 100000000,    
+                          EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                          CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+            mode: mode
+          };
+
+          // ObjTyp.SPHERE attributes are typ, recsz, r, g, b, spec, lamb, amb, opac, x, y, z, rad
+          var getPixelColor = gpu.createKernel(function(camera, lights, objects, activeVBoxes){
+
+              // Set colors to background color initially
+              var colorR = 0.95;
+              var colorG = 0.95;
+              var colorB = 0.95;
+
+              var camera_x = camera[0];
+              var camera_y = camera[1];
+              var camera_z = camera[2];
+              var cameraVector_x = camera[3];
+              var cameraVector_y = camera[4];
+              var cameraVector_z = camera[5];
+              var cameraFov = camera[6];
+
+              // Eye vector
+              var eyeVector_x = cameraVector_x - camera_x;
+              var eyeVector_y = cameraVector_y - camera_y;
+              var eyeVector_z = cameraVector_z - camera_z;
+              var eyeVector_size = magVector(eyeVector_x, eyeVector_y, eyeVector_z);
+              eyeVector_x = eyeVector_x / eyeVector_size;
+              eyeVector_y = eyeVector_y / eyeVector_size;
+              eyeVector_z = eyeVector_z / eyeVector_size;
+
+              // Cross product
+              // x: (a.y * b.z) - (a.z * b.y)
+              // y: (a.z * b.x) - (a.x * b.z)
+              // z: (a.x * b.y) - (a.y * b.x)
+              var vpRight_x = eyeVector_y*0 - eyeVector_z*1;
+              var vpRight_y = eyeVector_z*0 - eyeVector_x*0;
+              var vpRight_z = eyeVector_x*1 - eyeVector_y*0;
+              var vpRight_size = magVector(vpRight_x, vpRight_y, vpRight_z);
+              vpRight_x = vpRight_x / vpRight_size;
+              vpRight_y = vpRight_y / vpRight_size;
+              vpRight_z = vpRight_z / vpRight_size;
+
+              var vpUp_x = vpRight_y*eyeVector_z - vpRight_z*eyeVector_y;
+              var vpUp_y = vpRight_z*eyeVector_x - vpRight_x*eyeVector_z;
+              var vpUp_z = vpRight_x*eyeVector_y - vpRight_y*eyeVector_x;
+              var vpUp_size = magVector(vpUp_x, vpUp_y, vpUp_z);
+              vpUp_x = vpUp_x / vpUp_size;
+              vpUp_y = vpUp_y / vpUp_size;
+              vpUp_z = vpUp_z / vpUp_size;
+
+              var fovRadians = 3.142 * (cameraFov / 2) / 180;
+              var heightWidthRatio = this.constants.HEIGHT / this.constants.WIDTH;
+              var halfWidth = Math.tan(fovRadians);
+              var halfHeight = heightWidthRatio * halfWidth;
+              var cameraWidth = halfWidth * 2;
+              var cameraHeight = halfHeight * 2;
+              var pixelWidth = cameraWidth / (this.constants.WIDTH - 1);
+              var pixelHeight = cameraHeight / (this.constants.HEIGHT - 1);
+
+              // Determine the pixel to be traced
+              var vBoxIdx = Math.floor(this.thread.x / this.constants.UNITWIDTH);
+              var vBox_x = activeVBoxes[vBoxIdx][0];
+              var vBox_y = activeVBoxes[vBoxIdx][1];
+              var r = this.thread.x % this.constants.UNITWIDTH;
+              var pixel_x = getPixelCoord_x(vBox_x, r, this.constants.UNITWIDTH);
+              var pixel_y = getPixelCoord_y(vBox_y, this.thread.y, this.constants.UNITHEIGHT);
+
+              var xcomp_scale = (pixel_x * pixelWidth) - halfWidth;
+              var xcomp_x = vpRight_x * xcomp_scale;
+              var xcomp_y = vpRight_y * xcomp_scale;
+              var xcomp_z = vpRight_z * xcomp_scale;
+
+              var ycomp_scale = (pixel_y * pixelHeight) - halfHeight;
+              var ycomp_x = vpUp_x * ycomp_scale;
+              var ycomp_y = vpUp_y * ycomp_scale;
+              var ycomp_z = vpUp_z * ycomp_scale;
+
+              var rayVect_x = eyeVector_x + xcomp_x + ycomp_x;
+              var rayVect_y = eyeVector_y + xcomp_y + ycomp_y;
+              var rayVect_z = eyeVector_z + xcomp_z + ycomp_z;
+              var rayVect_size = magVector(rayVect_x, rayVect_y, rayVect_z);
+              rayVect_x = rayVect_x / rayVect_size;
+              rayVect_y = rayVect_y / rayVect_size;
+              rayVect_z = rayVect_z / rayVect_size;
+
+              // Indexes for traversing through objects
+              var nearestItrsect = this.constants.INFINITY;
+              var idx = 1;                                   
+              var nextidx = 1;  
+              
+              // ObjTyp.SPHERE attributes are typ, recsz, r, g, b, spec, lamb, amb, opac, x, y, z, rad
+              for (i=0; i<this.constants.OBJCOUNT; i++) {    
+                idx = nextidx;                               
+                nextidx = objects[idx+1]+idx;
+
+                var rootObj_RColor = objects[idx+2];
+                var rootObj_GColor = objects[idx+3];
+                var rootObj_BColor = objects[idx+4];
+                var rootObj_spec = objects[idx+5];
+                var rootObj_lamb = objects[idx+6];
+                var rootObj_amb = objects[idx+7];
+
+                // get start point of ray
+                var rayPt_x = camera_x;
+                var rayPt_y = camera_y;
+                var rayPt_z = camera_z;
+
+                // get direction vector of ray
+                var rayVect_x = rayVect_x;
+                var rayVect_y = rayVect_y;
+                var rayVect_z = rayVect_z;
+                var rayVect_size = 1;
+
+                // get object point
+                var objPt_x = objects[idx+9];
+                var objPt_y = objects[idx+10];
+                var objPt_z = objects[idx+11];
+                var objRad = objects[idx+12];
+
+                // Find vector between start point and center of sphere
+                var eye_to_center_x = objPt_x - rayPt_x;
+                var eye_to_center_y = objPt_y - rayPt_y;
+                var eye_to_center_z = objPt_z - rayPt_z;
+
+                // Find dot pdt between rayVect and eye_to_center
+                var dot_pdt = rayVect_x*eye_to_center_x+rayVect_y*eye_to_center_y+rayVect_z*eye_to_center_z;
+
+                // Find distance of start_to_obj
+                var eoDot = sqr(magVector(eye_to_center_x,eye_to_center_y,eye_to_center_z));
+
+                // Find discriminant
+                var discriminant = sqr(objRad) - eoDot + sqr(dot_pdt);
+
+                if (discriminant > 0){
+                  var distance = dot_pdt - Math.sqrt(discriminant);
+
+                  if (distance < nearestItrsect){
+                    nearestItrsect = distance;
+
+                    // Update start point with intersect point on sphere
+                    // Scale direction vector to distance 
+                    rayPt_x = rayPt_x + distance * rayVect_x;
+                    rayPt_y = rayPt_y + distance * rayVect_y;
+                    rayPt_z = rayPt_z + distance * rayVect_z;
+
+                    var normal_x = rayPt_x - objPt_x;
+                    var normal_y = rayPt_y - objPt_y;
+                    var normal_z = rayPt_z - objPt_z;
+                    var normal_size = magVector(normal_x, normal_y, normal_z);
+                    normal_x = normal_x / normal_size;
+                    normal_y = normal_y / normal_size;
+                    normal_z = normal_z / normal_size;
+
+                    var depth = 0;
+                    var pixel_RColor = 0;
+                    var pixel_GColor = 0;
+                    var pixel_BColor = 0;
+
+                    while (depth < this.constants.DEPTH){
+                      
+                      // -------------------- Process lights ------------------------
+                      var lightIdx = 1;
+                      var nextLightIdx = 1;
+                      var lightIdxInc = 6;
+                      var lambertAmt = 0;
+
+                      for (m=0; m<this.constants.LIGHTCOUNT; m++){
+                        lightIdx = nextLightIdx;
+                        nextLightIdx += lightIdxInc;
+
+                        // Check if light is visible
+                        // x,y,z,r,g,b
+                        var light_x = lights[lightIdx];
+                        var light_y = lights[lightIdx+1];
+                        var light_z = lights[lightIdx+2];
+                        var light_RColor = lights[lightIdx+3];
+                        var light_GColor = lights[lightIdx+4];
+                        var light_BColor = lights[lightIdx+5];
+
+                        // Calculate direction vector from light to obj intersect
+                        var lightVect_x = rayPt_x - light_x;
+                        var lightVect_y = rayPt_y - light_y;
+                        var lightVect_z = rayPt_z - light_z;
+                        var lightVect_size = magVector(lightVect_x, lightVect_y, lightVect_z);
+                        lightVect_x = lightVect_x/lightVect_size;
+                        lightVect_y = lightVect_y/lightVect_size;
+                        lightVect_z = lightVect_z/lightVect_size;
+
+                        var objIdx = 1;                                   
+                        var nextObjIdx = 1; 
+                        var nearestDist = this.constants.INFINITY; 
+
+                        for (i=0; i<this.constants.OBJCOUNT; i++) {    
+                          objIdx = nextObjIdx;                               
+                          nextObjIdx = objects[objIdx+1]+objIdx;
+
+                          // get object point
+                          // ObjTyp.SPHERE attributes
+                          // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad,
+                          var objPt_x = objects[objIdx+9];
+                          var objPt_y = objects[objIdx+10];
+                          var objPt_z = objects[objIdx+11];
+                          var objRad = objects[objIdx+12];
+
+                          // Find vector between start point and center of sphere
+                          var eye_to_center_x = objPt_x - rayPt_x;
+                          var eye_to_center_y = objPt_y - rayPt_y;
+                          var eye_to_center_z = objPt_z - rayPt_z;
+
+                          // Find dot pdt between rayVect and eye_to_center
+                          var dot_pdt = lightVect_x*eye_to_center_x+lightVect_y*eye_to_center_y+lightVect_z*eye_to_center_z;
+
+                          // Find distance of start_to_obj
+                          var eoDot = sqr(magVector(eye_to_center_x,eye_to_center_y,eye_to_center_z));
+
+                          // Find discriminant
+                          var discriminant = sqr(objRad) - eoDot + sqr(dot_pdt);
+
+                          if (discriminant > 0){
+                            var distance = dot_pdt - Math.sqrt(discriminant);
+                            if (distance < nearestDist){
+                              nearestDist = distance;
+                            }
+                          }
+                        }
+
+                        if (nearestDist > -0.005){
+                          var v_x = light_x - rayPt_x;
+                          var v_y = light_y - rayPt_y;
+                          var v_z = light_z - rayPt_z;
+                          var v_size = magVector(v_x, v_y, v_z);
+                          v_x = v_x / v_size;
+                          v_y = v_y / v_size;
+                          v_z = v_z / v_size;
+                          var contribution = v_x*normal_x + v_y*normal_y + v_z*normal_z;
+                          if (contribution > 0){
+                            lambertAmt = lambertAmt + contribution;
+                          }
+                        }
+
+                        lambertAmt = Math.min(1, lambertAmt);
+                        
+                        pixel_RColor += Math.pow(rootObj_spec, 0.5*depth) * (lambertAmt*rootObj_lamb*rootObj_RColor + rootObj_amb*rootObj_RColor);
+                        pixel_GColor += Math.pow(rootObj_spec, 0.5*depth) * (lambertAmt*rootObj_lamb*rootObj_GColor + rootObj_amb*rootObj_GColor);
+                        pixel_BColor += Math.pow(rootObj_spec, 0.5*depth) * (lambertAmt*rootObj_lamb*rootObj_BColor + rootObj_amb*rootObj_BColor);
+
+                        // Specular
+                        if (rootObj_spec > 0){
+                          // Get reflected object
+                          var idx = 1;
+                          var nextidx = 1;
+
+                          var nearestReItrsect = this.constants.INFINITY;
+                          for (i=0; i<this.constants.OBJCOUNT; i++) {    
+                            idx = nextidx;                               
+                            nextidx = objects[idx+1]+idx;
+
+                            var reObj_RColor = objects[idx+2];
+                            var reObj_GColor = objects[idx+3];
+                            var reObj_BColor = objects[idx+4];
+                            var reObj_spec = objects[idx+5];
+                            var reObj_lamb = objects[idx+6];
+                            var reObj_amb = objects[idx+7];
+
+                            // get start point of ray
+                            var reRayPt_x = rayPt_x;
+                            var reRayPt_y = rayPt_y;
+                            var reRayPt_z = rayPt_z;
+
+                            // get direction vector of ray
+                            var reRayVect_x = rayVect_x;
+                            var reRayVect_y = rayVect_y;
+                            var reRayVect_z = rayVect_z;
+                            var reRayVect_size = 1;
+
+                            // get object point
+                            var reObjPt_x = objects[idx+9];
+                            var reObjPt_y = objects[idx+10];
+                            var reObjPt_z = objects[idx+11];
+                            var reObjRad = objects[idx+12];
+
+                            // Find vector between start point and center of sphere
+                            var re_eye_to_center_x = reObjPt_x - reRayPt_x;
+                            var re_eye_to_center_y = reObjPt_y - reRayPt_y;
+                            var re_eye_to_center_z = reObjPt_z - reRayPt_z;
+
+                            // Find dot pdt between rayVect and eye_to_center
+                            var dot_pdt = reRayVect_x*re_eye_to_center_x+reRayVect_y*re_eye_to_center_y+reRayVect_z*re_eye_to_center_z;
+
+                            // Find distance of start_to_obj
+                            var eoDot = sqr(magVector(re_eye_to_center_x,re_eye_to_center_y,re_eye_to_center_z));
+
+                            // Find discriminant
+                            var discriminant = sqr(reObjRad) - eoDot + sqr(dot_pdt);
+
+                            if (discriminant > 0){
+                              var distance = dot_pdt - Math.sqrt(discriminant);
+
+                              if (distance < nearestReItrsect){
+                                nearestReItrsect = distance;
+                                rootObj_RColor = reObj_RColor;
+                                rootObj_GColor = reObj_GColor;
+                                rootObj_BColor = reObj_BColor;
+                                rootObj_spec = reObj_spec;
+                                rootObj_lamb = reObj_lamb;
+                                rootObj_amb = reObj_amb;
+
+                                // get start point of ray
+                                rayPt_x = reRayPt_x;
+                                rayPt_y = reRayPt_y;
+                                rayPt_z = reRayPt_z;
+
+                                // get direction vector of ray
+                                rayVect_x = reRayVect_x;
+                                rayVect_y = reRayVect_y;
+                                rayVect_z = reRayVect_z;
+                                rayVect_size = 1;
+
+                                // get object point
+                                objPt_x = reObjPt_x;
+                                objPt_y = reObjPt_y;
+                                objPt_z = reObjPt_z;
+                                objRad = reObjRad;
+                              }
+                            }
+                          }
+                          if (nearestReItrsect < this.constants.INFINITY){
+                            depth++;
+                          } else {
+                            depth = this.constants.DEPTH;
+                          }
+                        } else {
+                          depth = this.constants.DEPTH;
+                        }
+                      }
+                      // -------------- End of processing lights ---------------------
+                    }
+
+                    colorR = pixel_RColor;
+                    colorG = pixel_GColor;
+                    colorB = pixel_BColor;
+
+                  }
+                } 
+              }
+
+              return colorRgbToInt(colorR, colorG, colorB);
+          }, opt);
+          
+          return getPixelColor;
+        }
+
+        // Get the colour of each pixel for all active view boxes
+        mykernel = doit(mode); 
+        var result = mykernel(camera, lights, objects, activeVBoxes);
+        for (var i = 0; i < activeVBoxes.length; i++){
+          var vBox_x = activeVBoxes[i][0];
+          var vBox_y = activeVBoxes[i][1];
+          for (var w = 0; w < unitWidth; w++){
+            for (var h = 0; h < unitHeight; h++){
+              var pixel_x = getPixelCoord_x(vBox_x, w, unitWidth);
+              var pixel_y = getPixelCoord_y(vBox_y, h, unitHeight);
+              pixelColorMap[pixel_x][pixel_y] = result[h][i * unitWidth + w];
+            }
+          }
+        }
+
+        // Render the the pixel colour map 
+        mykernel = drawPixelColorMap(mode);
+        mykernel(pixelColorMap);
+        var canvas = mykernel.getCanvas();
+        document.getElementsByTagName('body')[0].appendChild(canvas);
+
+        // Time end
+        // var timeEnd = Date.now();
+        // alert('Milliseconds taken: ' + (timeEnd - timerStart).toString());
+
+
+        // Change location of objects for animation
+        angle += 0.8;
+        if (angle > 360){
+          angle = 0;
+        }
+        var angleRad = Math.PI * (angle/180);
+
+        objects[23] = 4 * Math.cos(angleRad);
+        objects[25] = -5 + 4 * Math.sin(angleRad);
+
+        objects[36] = 3 * Math.cos(angleRad);
+        objects[38] = -5 + 3 * Math.sin(angleRad);
+
+        objects[50] = 3 + 3 * Math.sin(angleRad);
+        objects[51] = -5 + 5 * Math.cos(angleRad);
+
+        requestAnimationFrame(renderLoop); 
+      }
+
+      window.onload = renderLoop;
+
+    </script>
+  </body>
+</html>
+
+
+
+
+
+
+

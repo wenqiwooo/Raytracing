@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script src="gpu.js"></script>
+  </head>
+  <body>
+    <div id="fps"></div>
+    <script>
+      var selection = 0;
+
+      var fps = { startTime : 0, frameNumber : 0,
+        getFPS : function() {
+          this.frameNumber++;
+          var d = new Date().getTime(), currentTime = ( d - this.startTime ) / 1000, result = Math.floor( ( this.frameNumber / currentTime ) );
+          if( currentTime > 1 ) {
+            this.startTime = new Date().getTime();
+            this.frameNumber = 0;
+          }
+          return result;
+        }
+      };
+
+    	function Enum(constantsList) {
+      		for (var i in constantsList) {
+         		this[constantsList[i]] = i;
+      		}
+   		}
+
+    	var ObjTyp = new Enum(['EMPTY', 'SPHERE', 'CUBOID', 'CYLINDER', 'CONE', 'TRIANGLE']);
+
+
+    	var camera = [
+      		400,200,-200,                     // x,y,z 
+      		0,0,1,                     // Direction normal 
+      		45                         // field of view : example 45
+   		];
+
+   		var lights = [
+      		1,                                                                                
+      		600,200,800, 0,1,0,        // light 1, x,y,z location, and rgb 
+      		200,200,600, 1,1,1,        // light 2, x,y,z location, and rgb 
+   		];
+
+    	var objects = [
+      			4, // number of objects                               
+      			ObjTyp.SPHERE,      13, 1.0,0.0,0.0,0.6,0.7,0.1,1.0, 400,200,500,100,           
+      			// typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad,           
+      			ObjTyp.SPHERE,      13, 0.0,0.0,1.0,0.6,0.7,0.1,1.0, 625,240,500,9,        
+      			// typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad,            
+            ObjTyp.SPHERE,      13, 0.0,1.0,0.0,0.6,0.7,0.1,1.0, 555,140,500,18,        
+            // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad,
+            ObjTyp.SPHERE,      13, 1.0,1.0,0.0,0.6,0.7,0.1,1.0, 400,240,500,20,        
+            // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad,
+            ObjTyp.CUBOID,      18, 1.0,0.0,0.0,0.2,0.7,0.1,1.0, 10,20,40, 40,20,10, 0,1,0
+            // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z, wid,hgt,dep, xd,yd,zd,       
+   		];
+
+      var gpu = new GPU();
+
+      function sqr(x) {
+      		return x*x;
+   		}
+
+  		function dist(x1,y1,x2,y2) {
+  		    return Math.sqrt( sqr(x2-x1)+sqr(y2-y1) );
+  		}
+
+      function magVector(x,y,z){
+          return Math.sqrt( Math.pow(x,2)+Math.pow(y,2)+Math.pow(z,2) );
+      }
+
+		  gpu.addFunction(sqr);
+		  gpu.addFunction(dist);
+      gpu.addFunction(magVector);
+
+      function doit(mode){
+  		  var opt = {
+        	dimensions: [800,400],
+        	debug: true,
+        	graphical: true,
+        	safeTextureReadHack: false,
+        	constants: { OBJCOUNT: objects[0],
+                        LIGHTCOUNT: lights[0],
+                        WIDTH: 800, HEIGHT: 400,
+                        DEPTH: 3,
+                        PI: 3.1415,     
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                      	CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+         	mode: mode
+      	};
+
+        // ObjTyp.SPHERE attributes
+        // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad, 
+  		  var render = gpu.createKernel(function(camera, lights, objects){
+            this.color(0.05,0.05,0.05);
+            //this.color(0.95,0.95,0.95);
+  		      var idx = 1;                                   
+            var nextidx = 1;   
+
+            var camera_x = camera[0];
+            var camera_y = camera[1];
+            var camera_z = camera[2];
+            var cameraNormal_x = camera[3];
+            var cameraNormal_y = camera[4];
+            var cameraNormal_z = camera[5];
+
+            var cameraFov = this.constants.PI*camera[6]/360;
+            var aspect = this.constants.WIDTH/this.constants.HEIGHT;
+            var halfHeight = Math.tan(cameraFov);
+            var halfWidth = aspect * halfHeight;
+            var cameraWidth = halfWidth * 2;
+            var cameraHeight = halfHeight * 2;
+            var pixelWidth = cameraWidth/(this.constants.WIDTH - 1);
+            var pixelHeight = cameraHeight/(this.constants.HEIGHT - 1);
+
+            var nearestItrsect = 10000000;
+
+            // for each object                   
+           	for (i=0; i<this.constants.OBJCOUNT; i++) {    
+              idx = nextidx;                               
+              nextidx = objects[idx+1]+idx;
+
+              // FIRST RUN ============================================
+
+              // get start point
+              var startPt_x = camera_x;
+              var startPt_y = camera_y;
+              var startPt_z = camera_z;
+              
+              // get direction vector of ray
+              var dirVect_x = (this.thread.x * pixelWidth) - halfWidth;
+              var dirVect_y = (this.thread.y * pixelHeight) - halfHeight;
+              var dirVect_z = cameraNormal_z;
+              var dirVect_size = magVector(dirVect_x, dirVect_y, dirVect_z);
+              dirVect_x = dirVect_x/dirVect_size;
+              dirVect_y = dirVect_y/dirVect_size;
+              dirVect_z = dirVect_z/dirVect_size;
+
+              // For specular lighting =========================
+              var rootObjViewPt_x = dirVect_x;
+              var rootObjViewPt_y = dirVect_y;
+              var rootObjViewPt_z = dirVect_z;
+              // ===============================================
+
+              // SPHERE
+              if (objects[idx] == this.constants.SPHERE){
+                // get object point
+                var objPt_x = objects[idx+9];
+                var objPt_y = objects[idx+10];
+                var objPt_z = objects[idx+11];
+                var objPt_rad = objects[idx+12];
+
+                // Find vector between start point and center of sphere
+                var start_to_obj_x = startPt_x - objPt_x;
+                var start_to_obj_y = startPt_y - objPt_y;
+                var start_to_obj_z = startPt_z - objPt_z;
+
+                // Find dot pdt between direction vector and start_to_obj
+                var dot_pdt = dirVect_x*start_to_obj_x+dirVect_y*start_to_obj_y+dirVect_z*start_to_obj_z;
+
+                // Find distance of start_to_obj
+                var start_to_obj_len = magVector(start_to_obj_x,start_to_obj_y,start_to_obj_z);
+
+                // Find discriminant
+                // var discriminant = sqr(objPt_rad) - start_to_obj_len + sqr(dot_pdt);
+                var discriminant = 4*(sqr(objPt_rad) - sqr(start_to_obj_len)) + sqr(2*dot_pdt);
+
+                if (discriminant > 0){
+                  // var distance = dot_pdt - Math.sqrt(discriminant);
+                  var distance = (-2*dot_pdt - Math.sqrt(discriminant))/2;
+                  if (distance < nearestItrsect){
+                    nearestItrsect = distance;
+
+                    // Update start point with intersect point on sphere
+                    // scale direction vector to distance 
+                    startPt_x = startPt_x + distance*dirVect_x;
+                    startPt_y = startPt_y + distance*dirVect_y;
+                    startPt_z = startPt_z + distance*dirVect_z;
+
+                    // LIGHTS =================
+                    // Save startPt as rootObjItrsect (will be used for lights)
+                    var rootObjItrsect_x = startPt_x;
+                    var rootObjItrsect_y = startPt_y;
+                    var rootObjItrsect_z = startPt_z;
+                    // var rootObjNormal_x = startPt_x - objPt_x;
+                    // var rootObjNormal_y = startPt_y - objPt_y;
+                    // var rootObjNormal_z = startPt_z - objPt_z;
+                    var rootObjNormal_x = objPt_x - startPt_x;
+                    var rootObjNormal_y = objPt_y - startPt_y;
+                    var rootObjNormal_z = objPt_z - startPt_z;
+                    var rootObjNormal_size = magVector(rootObjNormal_x, rootObjNormal_y, rootObjNormal_z);
+                    rootObjNormal_x = rootObjNormal_x/rootObjNormal_size;
+                    rootObjNormal_y = rootObjNormal_y/rootObjNormal_size;
+                    rootObjNormal_z = rootObjNormal_z/rootObjNormal_size;
+                    // LIGHTS =================
+
+                    // Find normal of intersection point on sphere
+                    var normal_x = startPt_x - objPt_x;
+                    var normal_y = startPt_y - objPt_y;
+                    var normal_z = startPt_z - objPt_z;
+
+                    // TEST================
+                    // dirVect_x = -dirVect_x;
+                    // dirVect_y = -dirVect_y;
+                    // dirVect_z = -dirVect_z;
+                    // TEST================
+
+                    // Find dot product of normal vector and direction vector
+                    var dotPdt = (normal_x*dirVect_x+normal_y*dirVect_y+normal_z*dirVect_z);
+
+                    // update new direction vector with reflected vector
+                    dirVect_x = 2*dotPdt*normal_x - dirVect_x;
+                    dirVect_y = 2*dotPdt*normal_y - dirVect_y;
+                    dirVect_z = 2*dotPdt*normal_z - dirVect_z;
+                    dirVect_size = magVector(dirVect_x, dirVect_y, dirVect_z);
+                    dirVect_x = dirVect_x/dirVect_size;
+                    dirVect_y = dirVect_y/dirVect_size;
+                    dirVect_z = dirVect_z/dirVect_size;
+
+                    // For specular lighting =========================
+                    var rootObjReflectDir_x = dirVect_x;
+                    var rootObjReflectDir_y = dirVect_y;
+                    var rootObjReflectDir_z = dirVect_z;
+                    // ===============================================
+
+                    // INNER FUNCTION ====================================
+                    
+                    var prevObjIdx = idx;
+                    var nextObjIdx = 1;
+                    var currObjIdx = 1;
+
+                    // Storage variables
+                    var newStartPt_x = startPt_x;
+                    var newStartPt_y = startPt_y;
+                    var newStartPt_z = startPt_z;
+                    var newDirVect_x = dirVect_x;
+                    var newDirVect_y = dirVect_y;
+                    var newDirVect_z = dirVect_z;
+                    var newDirVect_size = 1;
+                    var newPrevObjIdx = idx;
+
+                    var depth = this.constants.DEPTH;
+                    while (depth > 0){
+                      var nearestObjDist = 100000000;
+
+                      for (j=0; j<this.constants.OBJCOUNT; j++){
+                        // Update indexes
+                        currObjIdx = nextObjIdx;
+                        nextObjIdx = objects[currObjIdx+1]+currObjIdx;
+                        // If current object is same as the previous object, we skip it
+                        if (currObjIdx != prevObjIdx){
+
+                          //======TEST=======
+                          // Fetch z index from parent object
+                          var parentObj_z = objPt_z;
+
+                          // sphere point
+                          var objPt_x = objects[currObjIdx+9];
+                          var objPt_y = objects[currObjIdx+10];
+                          var objPt_z = objects[currObjIdx+11];
+                          var objPt_rad = objects[currObjIdx+12];
+
+                          // Find vector between start point and center of sphere
+                          var start_to_obj_x = startPt_x - objPt_x;
+                          var start_to_obj_y = startPt_y - objPt_y;
+                          var start_to_obj_z = startPt_z - objPt_z;
+
+                          // Find dot pdt between direction vector and start_to_obj
+                          var dot_pdt = dirVect_x*start_to_obj_x+dirVect_y*start_to_obj_y+dirVect_z*start_to_obj_z;
+
+                          // Find distance of start_to_obj
+                          var start_to_obj_len = magVector(start_to_obj_x,start_to_obj_y,start_to_obj_z);
+
+                          // Find discriminant
+                          // var discriminant = sqr(objPt_rad) - start_to_obj_len + sqr(dot_pdt);
+                          var discriminant = 4*(sqr(objPt_rad) - sqr(start_to_obj_len)) + sqr(2*dot_pdt);
+
+                          //======ENDTEST=======
+                          // Need to also check that object is in front of the parent!
+                          if (discriminant < 0 || parentObj_z < objPt_z){
+                            // no intersection
+                            // early exit
+                            if (j < this.constants.OBJCOUNT+0.4 && j > this.constants.OBJCOUNT-0.4 && nearestObjDist > 9000000){
+                              depth = 0;
+                            }
+                          } else {
+                            var distance = (-2*dot_pdt - Math.sqrt(discriminant))/2;
+
+                            if (distance < nearestObjDist){
+                              nearestObjDist = distance;
+                              // Update the values of start vector
+                              newStartPt_x = startPt_x + distance*dirVect_x;
+                              newStartPt_y = startPt_y + distance*dirVect_y;
+                              newStartPt_z = startPt_z + distance*dirVect_z;
+
+                              // Set index of last reflected obj to be that of current obj
+                              newPrevObjIdx = currObjIdx;
+
+                              // Find normal of intersection point on sphere
+                              var normal_x = newStartPt_x - objPt_x;
+                              var normal_y = newStartPt_y - objPt_y;
+                              var normal_z = newStartPt_z - objPt_z;
+
+                              // Find dot product of normal vector and direction vector
+                              // var dotPdt = (normal_x*(-dirVect_x)+normal_y*(-dirVect_y)+normal_z*(-dirVect_z));
+                              var dotPdt = (normal_x*(dirVect_x)+normal_y*(dirVect_y)+normal_z*(dirVect_z));
+                              // update new direction vector with reflected vector
+                              newDirVect_x = 2*dotPdt*normal_x - dirVect_x;
+                              newDirVect_y = 2*dotPdt*normal_y - dirVect_y;
+                              newDirVect_z = 2*dotPdt*normal_z - dirVect_z;
+                              newDirVect_size = magVector(newDirVect_x, newDirVect_y, newDirVect_z);
+                              newDirVect_x = newDirVect_x/newDirVect_size;
+                              newDirVect_y = newDirVect_y/newDirVect_size;
+                              newDirVect_z = newDirVect_z/newDirVect_size;
+                            }
+                          }
+                        }
+                      }
+
+                      // Set index of last reflected obj to be that of current obj
+                      prevObjIdx = newPrevObjIdx;
+                      // Update the parameters with the attributes of the nearest intersected object
+                      startPt_x = newStartPt_x;
+                      startPt_y = newStartPt_y;
+                      startPt_z = newStartPt_z;
+                      dirVect_x = newDirVect_x;
+                      dirVect_y = newDirVect_y;
+                      dirVect_z = newDirVect_z;
+
+                      depth--;
+                    } 
+                    
+                    // END INNER FUNCTION ==============================================
+                    // After finishing the while loop, update the colour
+                    // Obtain values of current object
+                    // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad,
+                    var finalObj_amb = objects[prevObjIdx+7];
+                    var finalObj_RColor = objects[prevObjIdx+2];
+                    var finalObj_GColor = objects[prevObjIdx+3];
+                    var finalObj_BColor = objects[prevObjIdx+4];
+
+                    // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad,
+                    var rootObj_lamb = objects[idx+6];
+                    var rootObj_spec = objects[idx+5];
+                    var rootObj_RColor = objects[idx+2];
+                    var rootObj_GColor = objects[idx+3];
+                    var rootObj_BColor = objects[idx+4];
+
+                    var pixel_RColor = finalObj_amb*finalObj_RColor;
+                    var pixel_GColor = finalObj_amb*finalObj_GColor;
+                    var pixel_BColor = finalObj_amb*finalObj_BColor;  
+
+                    // LIGHTS ======================================================
+                    // x,y,z,r,g,b
+                    var lightIdx = 1;
+                    var nextLightIdx = 1;
+                    var lightIdxInc = 6;
+                    for ( m=0; m<this.constants.LIGHTCOUNT; m++ ){
+                      lightIdx = nextLightIdx;
+                      nextLightIdx += lightIdxInc;
+
+                      var light_x = lights[lightIdx];
+                      var light_y = lights[lightIdx+1];
+                      var light_z = lights[lightIdx+2];
+                      var light_RColor = lights[lightIdx+3];
+                      var light_GColor = lights[lightIdx+4];
+                      var light_BColor = lights[lightIdx+5];
+
+                      // Calculate direction vector from light to obj intersect
+                      var lightDirVect_x = light_x - rootObjItrsect_x;
+                      var lightDirVect_y = light_y - rootObjItrsect_y;
+                      var lightDirVect_z = light_z - rootObjItrsect_z;
+                      var lightDirVect_size = magVector(lightDirVect_x, lightDirVect_y, lightDirVect_z);
+                      lightDirVect_x = lightDirVect_x/lightDirVect_size;
+                      lightDirVect_y = lightDirVect_y/lightDirVect_size;
+                      lightDirVect_z = lightDirVect_z/lightDirVect_size;
+
+                      // CHECK FOR SHADOWS =============================
+                      var isBlocked = 0;
+                      var objIdx = 1;
+                      var nextObjIdx = 1;
+                      for ( n=0; n<this.constants.OBJCOUNT; n++ ){
+                        // Update indexes
+                        objIdx = nextObjIdx;
+                        nextObjIdx = objects[objIdx+1]+nextObjIdx;
+                        if (isBlocked < 0.5){
+                          // Check if vector from obj to light is intercepted by other objects, including itself
+                          // get object point
+                          var objPt_x = objects[objIdx+9];
+                          var objPt_y = objects[objIdx+10];
+                          var objPt_z = objects[objIdx+11];
+                          var objPt_rad = objects[objIdx+12];
+
+                          // Find vector between light and center of blocking sphere
+                          var light_to_obj_x = light_x - objPt_x;
+                          var light_to_obj_y = light_y - objPt_y;
+                          var light_to_obj_z = light_z - objPt_z;
+
+                          // Find dot pdt between light direction vector and light_to_obj
+                          var dot_pdt = lightDirVect_x*light_to_obj_x+lightDirVect_y*light_to_obj_y+lightDirVect_z*light_to_obj_z;
+
+                          // Find distance of start_to_obj
+                          var light_to_obj_len = magVector(light_to_obj_x,light_to_obj_y,light_to_obj_z);
+
+                          // Find discriminant
+                          var discriminant = 4*(sqr(objPt_rad) - sqr(light_to_obj_len)) + sqr(2*dot_pdt);
+
+                          if (discriminant > 0){
+                            var distance = (-2*dot_pdt - Math.sqrt(discriminant))/2;
+                            if (distance < lightDirVect_size){
+                              // Check if object lies between light and root obj
+                              if (((objPt_x > rootObjItrsect_x && objPt_x < light_x)||(objPt_x > light_x && objPt_x < rootObjItrsect_x)) &&
+                                ((objPt_y > rootObjItrsect_y && objPt_y < light_y)||(objPt_y > light_y && objPt_y < rootObjItrsect_y)) && 
+                                ((objPt_z > rootObjItrsect_z && objPt_z < light_z)||(objPt_z > light_z && objPt_z < rootObjItrsect_z))){
+                                isBlocked = 1;
+                              }
+                            }
+                          }
+                        }
+                      }
+                      // END CHECK FOR SHADOWS =============================
+
+                      if (isBlocked < 0.5){
+                        
+                      } 
+
+                      // DIFFUSE ===========================
+                      var diffuse = rootObj_lamb*((rootObjNormal_x*lightDirVect_x + rootObjNormal_y*lightDirVect_y + rootObjNormal_z*lightDirVect_z));
+                      if (diffuse < 0){
+                        diffuse = 0;
+                      }
+                      pixel_RColor += diffuse*rootObj_RColor;
+                      pixel_GColor += diffuse*rootObj_GColor;
+                      pixel_BColor += diffuse*rootObj_BColor;
+                      // END DIFFUSE ========================
+
+                      // SPECULAR ===========================
+                      var factor = lightDirVect_x*rootObjReflectDir_x+lightDirVect_y*rootObjReflectDir_y+lightDirVect_z*rootObjReflectDir_z;
+                      var specular = Math.pow(factor,20)*rootObj_spec;
+                      pixel_RColor += specular;
+                      pixel_GColor += specular;
+                      pixel_BColor += specular;
+                      // END SPECULAR =======================
+                    }
+
+                    // END LIGHTS ==================================================
+
+                    // Finally, show the color
+                    this.color(pixel_RColor, pixel_GColor, pixel_BColor);
+
+                  }
+                }
+
+              } else if (objects[idx] == this.constants.CUBOID){
+
+                var objPt_x = objects[idx+9];
+                var objPt_y = objects[idx+10];
+                var objPt_z = objects[idx+11];
+                var objPt_wid = objects[idx+12];
+                var objPt_hgt = objects[idx+13];
+                var objPt_dep = objects[idx+14];
+                var objNormal_x = objects[idx+15];
+                var objNormal_y = objects[idx+16];
+                var objNormal_z = objects[idx+17];
+
+                
+
+              }
+
+              // FIRST RUN =======================================================
+
+           	}
+  		  }, opt);
+        
+        return render;
+      }
+
+      var mykernel = doit("gpu");
+      mykernel(camera,lights,objects);
+  		var canvas = mykernel.getCanvas();
+  		document.getElementsByTagName('body')[0].appendChild(canvas);
+
+      var f = document.querySelector("#fps");
+      var angle = 0;
+      var orbitRadius = 225;
+
+      function renderLoop() {
+        f.innerHTML = fps.getFPS();
+        if (selection === 0) {
+          mykernel(camera,lights,objects);
+          var cv = document.getElementsByTagName("canvas")[0];
+          var bdy = cv.parentNode;
+          var newCanvas = mykernel.getCanvas();
+          bdy.replaceChild(newCanvas, cv);
+        } else {
+          mykernel(camera,lights,objects);
+          var cv = document.getElementsByTagName("canvas")[0];
+          var bdy = cv.parentNode;
+          var newCanvas = mykernel.getCanvas();
+          bdy.replaceChild(newCanvas, cv);
+        }
+        // Change location of objects
+        angle+=0.8;
+        if (angle > 360){
+          angle = 0;
+        }
+        var angleRad = Math.PI * (angle/180);
+
+        var x = orbitRadius * Math.cos(angleRad);
+        var z = orbitRadius * Math.sin(angleRad);
+        objects[23] = 400 + x;
+        objects[25] = 400 + z;
+
+        var x2 = (orbitRadius-70) * Math.cos(angleRad);
+        var z2 = (orbitRadius-70) * Math.sin(angleRad);
+        objects[36] = 400 + x2;
+        objects[38] = 400 + z2;
+
+        var y3 = (orbitRadius-185) * Math.sin(angleRad);
+        var z3 = (orbitRadius-185) * Math.cos(angleRad);
+        objects[50] = 200 + x2;
+        objects[51] = 500 + z2;
+
+        // setTimeout(renderLoop,1); 
+        requestAnimationFrame(renderLoop);     
+      }
+      window.onload = renderLoop;
+    </script>
+  </body>
+</html>

@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script src="gpu.js"></script>
+    <script src="functions.js"></script>
+  </head>
+  <body>
+    <div id="fps"></div>
+    <script>
+      var selection = 0;
+
+      var fps = { startTime : 0, frameNumber : 0,
+        getFPS : function() {
+          this.frameNumber++;
+          var d = new Date().getTime(), currentTime = ( d - this.startTime ) / 1000, result = Math.floor( ( this.frameNumber / currentTime ) );
+          if( currentTime > 1 ) {
+            this.startTime = new Date().getTime();
+            this.frameNumber = 0;
+          }
+          return result;
+        }
+      };
+
+      function Enum(constantsList) {
+        for (var i in constantsList) {
+          this[constantsList[i]] = i;
+        }
+      }
+
+      var ObjTyp = new Enum(['EMPTY', 'SPHERE', 'CUBOID', 'CYLINDER', 'CONE', 'TRIANGLE']);
+
+
+      var camera = [
+        0,1.8,15,              // x,y,z 
+        0,3,0,                     // Vector
+        45                         // field of view : example 45
+      ];
+
+      var lights = [
+        2,                                                                                
+        -30,-10,10, 1,1,1,        // light 1, x,y,z location, and rgb 
+        30,3,20, 1,1,1,        // light 2, x,y,z location, and rgb 
+      ];
+
+      var objects = [
+        4, // number of objects                               
+        ObjTyp.SPHERE,      13, 0.0,0.0,1.0,0.2,0.7,0.1,1.0, 0,3,-5,2,        
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad,            
+        ObjTyp.SPHERE,      13, 1.0,0.0,0.0,0.2,0.7,0.1,1.0, -4,2,-5,0.2,           
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad,           
+        ObjTyp.SPHERE,      13, 0.0,1.0,0.0,0.2,0.7,0.1,1.0, -3,3,-5,0.6,        
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad,
+        ObjTyp.SPHERE,      13, 1.0,1.0,0.0,0.2,0.7,0.1,1.0, 0,13,-10,0.1        
+        // typ,recsz,r,g,b,spec,lamb,amb,opac,x,y,z,rad,       
+      ];
+
+      var gpu = new GPU();
+
+		  gpu.addFunction(sqr);
+		  gpu.addFunction(dist);
+      gpu.addFunction(magVector);
+      gpu.addFunction(intersectBB);
+      gpu.addFunction(getScalingForZDepth);
+      gpu.addFunction(checkOverlappingSquares);
+      gpu.addFunction(colorRgbToInt);
+      gpu.addFunction(getPixelCoord_x);
+      gpu.addFunction(getPixelCoord_y);
+      gpu.addFunction(getColorHueFromInt);
+
+      function prepare(mode){
+        var opt = {
+          dimensions: [objects[0] * 6 + 1],
+          debug: true,
+          graphical: false,
+          constants: { OBJCOUNT: objects[0],  
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        var preprocess = gpu.createKernel(function(objects){
+          if (this.thread.x == 0){
+            return objects[0];
+          }
+
+          // 6 features: min_x, min_y, min_z, max_x, max_y, max_z
+          var idx = (Math.floor((this.thread.x - 1) / 6)) * 13 + 1;
+          var k = (this.thread.x - 1) % 6;
+          if (k == 0){
+            // Find x
+            return objects[idx+9] - objects[idx+12];
+          } else if (k == 1){
+            // Find y
+            return objects[idx+10] - objects[idx+12];
+          } else if (k == 2){
+            // Find z
+            return objects[idx+11] - objects[idx+12];
+          } else if (k == 3){
+            // Find wid
+            return objects[idx+9] + objects[idx+12];
+          } else if (k == 4){
+            // Find hgt
+            return objects[idx+10] + objects[idx+12];
+          } else if (k == 5){
+            // Find dep
+            return objects[idx+11] + objects[idx+12];
+          } 
+        }, opt);
+        return preprocess;
+      }
+
+      // get bounding boxes
+      var mykernel = prepare("gpu");
+      var bboxes = mykernel(objects);
+
+      var width = 400;
+      var height = 200;
+      var unitWidth = 20;
+      var unitHeight = 20;
+
+      var viewBoxRow_len = width / unitWidth;
+      var viewBoxCol_len = height / unitHeight;
+
+      function getActiveViewBoxes(mode){
+        var opt = {
+          dimensions: [viewBoxRow_len, viewBoxCol_len],
+          debug: true,
+          graphical: false,
+          safeTextureReadHack: false,
+          constants: { OBJCOUNT: objects[0],
+                        WIDTH: width, HEIGHT: height,
+                        UNITWIDTH: unitWidth, UNITHEIGHT: unitHeight, 
+                        INFINITY: 100000000,   
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        var getActiveViewBoxesKernel = gpu.createKernel(function(camera, bboxes){
+          // this.color(0.95, 0.95, 0.95);
+
+          var camera_x = camera[0];
+          var camera_y = camera[1];
+          var camera_z = camera[2];
+          var cameraVector_x = camera[3];
+          var cameraVector_y = camera[4];
+          var cameraVector_z = camera[5];
+          var cameraFov = camera[6];
+
+          // Eye vector
+          var eyeVector_x = cameraVector_x - camera_x;
+          var eyeVector_y = cameraVector_y - camera_y;
+          var eyeVector_z = cameraVector_z - camera_z;
+          var eyeVector_size = magVector(eyeVector_x, eyeVector_y, eyeVector_z);
+          eyeVector_x = eyeVector_x / eyeVector_size;
+          eyeVector_y = eyeVector_y / eyeVector_size;
+          eyeVector_z = eyeVector_z / eyeVector_size;
+
+          // Cross product
+          // x: (a.y * b.z) - (a.z * b.y)
+          // y: (a.z * b.x) - (a.x * b.z)
+          // z: (a.x * b.y) - (a.y * b.x)
+          var vpRight_x = eyeVector_y*0 - eyeVector_z*1;
+          var vpRight_y = eyeVector_z*0 - eyeVector_x*0;
+          var vpRight_z = eyeVector_x*1 - eyeVector_y*0;
+          var vpRight_size = magVector(vpRight_x, vpRight_y, vpRight_z);
+          vpRight_x = vpRight_x / vpRight_size;
+          vpRight_y = vpRight_y / vpRight_size;
+          vpRight_z = vpRight_z / vpRight_size;
+
+          var vpUp_x = vpRight_y*eyeVector_z - vpRight_z*eyeVector_y;
+          var vpUp_y = vpRight_z*eyeVector_x - vpRight_x*eyeVector_z;
+          var vpUp_z = vpRight_x*eyeVector_y - vpRight_y*eyeVector_x;
+          var vpUp_size = magVector(vpUp_x, vpUp_y, vpUp_z);
+          vpUp_x = vpUp_x / vpUp_size;
+          vpUp_y = vpUp_y / vpUp_size;
+          vpUp_z = vpUp_z / vpUp_size;
+
+          var fovRadians = 3.142 * (cameraFov / 2) / 180;
+          var heightWidthRatio = this.constants.HEIGHT / this.constants.WIDTH;
+          var halfWidth = Math.tan(fovRadians);
+          var halfHeight = heightWidthRatio * halfWidth;
+          var cameraWidth = halfWidth * 2;
+          var cameraHeight = halfHeight * 2;
+          var pixelWidth = cameraWidth / (this.constants.WIDTH - 1);
+          var pixelHeight = cameraHeight / (this.constants.HEIGHT - 1);
+
+          // 0,0  19,0  19,19, 0,19
+          // GET THE 4 BOUNDARY POINTS ===============================
+          var x0 = this.thread.x * this.constants.UNITWIDTH;
+          var y0 = this.thread.y * this.constants.UNITHEIGHT;
+
+          var x1 = (this.thread.x + 1) * this.constants.UNITWIDTH - 1;
+          var y1 = y0;
+
+          var x2 = x1;
+          var y2 = (this.thread.y + 1) * this.constants.UNITHEIGHT - 1;
+
+          var x3 = x0;
+          var y3 = y2;
+          // =========================================================
+
+          // GET ALL 4 DIRECTION VECTORS =============================
+          // 0
+          var xcomp0_scale = (x0 * pixelWidth) - halfWidth;
+          var xcomp0_x = vpRight_x * xcomp0_scale;
+          var xcomp0_y = vpRight_y * xcomp0_scale;
+          var xcomp0_z = vpRight_z * xcomp0_scale;
+
+          var ycomp0_scale = (y0 * pixelHeight) - halfHeight;
+          var ycomp0_x = vpUp_x * ycomp0_scale;
+          var ycomp0_y = vpUp_y * ycomp0_scale;
+          var ycomp0_z = vpUp_z * ycomp0_scale;
+
+          var rayVect0_x = eyeVector_x + xcomp0_x + ycomp0_x;
+          var rayVect0_y = eyeVector_y + xcomp0_y + ycomp0_y;
+          var rayVect0_z = eyeVector_z + xcomp0_z + ycomp0_z;
+          var rayVect0_size = magVector(rayVect0_x, rayVect0_y, rayVect0_z);
+          rayVect0_x = rayVect0_x / rayVect0_size;
+          rayVect0_y = rayVect0_y / rayVect0_size;
+          rayVect0_z = rayVect0_z / rayVect0_size;
+
+          // 1
+          var xcomp1_scale = (x1 * pixelWidth) - halfWidth;
+          var xcomp1_x = vpRight_x * xcomp1_scale;
+          var xcomp1_y = vpRight_y * xcomp1_scale;
+          var xcomp1_z = vpRight_z * xcomp1_scale;
+
+          var ycomp1_scale = (y1 * pixelHeight) - halfHeight;
+          var ycomp1_x = vpUp_x * ycomp1_scale;
+          var ycomp1_y = vpUp_y * ycomp1_scale;
+          var ycomp1_z = vpUp_z * ycomp1_scale;
+
+          var rayVect1_x = eyeVector_x + xcomp1_x + ycomp1_x;
+          var rayVect1_y = eyeVector_y + xcomp1_y + ycomp1_y;
+          var rayVect1_z = eyeVector_z + xcomp1_z + ycomp1_z;
+          var rayVect1_size = magVector(rayVect1_x, rayVect1_y, rayVect1_z);
+          rayVect1_x = rayVect1_x / rayVect1_size;
+          rayVect1_y = rayVect1_y / rayVect1_size;
+          rayVect1_z = rayVect1_z / rayVect1_size;
+
+          // 2
+          var xcomp2_scale = (x2 * pixelWidth) - halfWidth;
+          var xcomp2_x = vpRight_x * xcomp2_scale;
+          var xcomp2_y = vpRight_y * xcomp2_scale;
+          var xcomp2_z = vpRight_z * xcomp2_scale;
+
+          var ycomp2_scale = (y2 * pixelHeight) - halfHeight;
+          var ycomp2_x = vpUp_x * ycomp2_scale;
+          var ycomp2_y = vpUp_y * ycomp2_scale;
+          var ycomp2_z = vpUp_z * ycomp2_scale;
+
+          var rayVect2_x = eyeVector_x + xcomp2_x + ycomp2_x;
+          var rayVect2_y = eyeVector_y + xcomp2_y + ycomp2_y;
+          var rayVect2_z = eyeVector_z + xcomp2_z + ycomp2_z;
+          var rayVect2_size = magVector(rayVect2_x, rayVect2_y, rayVect2_z);
+          rayVect2_x = rayVect2_x / rayVect2_size;
+          rayVect2_y = rayVect2_y / rayVect2_size;
+          rayVect2_z = rayVect2_z / rayVect2_size;
+
+          // 3
+          var xcomp3_scale = (x3 * pixelWidth) - halfWidth;
+          var xcomp3_x = vpRight_x * xcomp3_scale;
+          var xcomp3_y = vpRight_y * xcomp3_scale;
+          var xcomp3_z = vpRight_z * xcomp3_scale;
+
+          var ycomp3_scale = (y3 * pixelHeight) - halfHeight;
+          var ycomp3_x = vpUp_x * ycomp3_scale;
+          var ycomp3_y = vpUp_y * ycomp3_scale;
+          var ycomp3_z = vpUp_z * ycomp3_scale;
+
+          var rayVect3_x = eyeVector_x + xcomp3_x + ycomp3_x;
+          var rayVect3_y = eyeVector_y + xcomp3_y + ycomp3_y;
+          var rayVect3_z = eyeVector_z + xcomp3_z + ycomp3_z;
+          var rayVect3_size = magVector(rayVect3_x, rayVect3_y, rayVect3_z);
+          rayVect3_x = rayVect3_x / rayVect3_size;
+          rayVect3_y = rayVect3_y / rayVect3_size;
+          rayVect3_z = rayVect3_z / rayVect3_size;
+          // =========================================================
+
+          var rayPt_x = camera_x;
+          var rayPt_y = camera_y;
+          var rayPt_z = camera_z;
+
+          var idx = 1;                                   
+          var nextidx = 1;  
+          var idxInc = 6;
+          // for each bounding box                 
+          // min_x, min_y, min_z, max_x, max_y, max_z
+          for (i = 0; i < this.constants.OBJCOUNT; i++) {    
+            idx = nextidx;                               
+            nextidx = idx + idxInc;
+            var bb_min_x = bboxes[idx];
+            var bb_min_y = bboxes[idx + 1];
+            var bb_min_z = bboxes[idx + 2];
+            var bb_max_x = bboxes[idx + 3];
+            var bb_max_y = bboxes[idx + 4];
+            var bb_max_z = bboxes[idx + 5];
+
+            // Get all 4 coordinates at bb_min_z and bb_max_z depths ================
+            // Get coord 0
+            var coord0_min_scale = getScalingForZDepth(rayPt_z, rayVect0_z, bb_min_z);
+            var coord0_min_x = rayPt_x + coord0_min_scale * rayVect0_x;
+            var coord0_min_y = rayPt_y + coord0_min_scale * rayVect0_y;
+            var coord0_max_scale = getScalingForZDepth(rayPt_z, rayVect0_z, bb_max_z);
+            var coord0_max_x = rayPt_x + coord0_max_scale * rayVect0_x;
+            var coord0_max_y = rayPt_y + coord0_max_scale * rayVect0_y;
+
+            // Get coord 1
+            var coord1_min_scale = getScalingForZDepth(rayPt_z, rayVect1_z, bb_min_z);
+            var coord1_min_x = rayPt_x + coord1_min_scale * rayVect1_x;
+            var coord1_min_y = rayPt_y + coord1_min_scale * rayVect1_y;
+            var coord1_max_scale = getScalingForZDepth(rayPt_z, rayVect1_z, bb_max_z);
+            var coord1_max_x = rayPt_x + coord1_max_scale * rayVect1_x;
+            var coord1_max_y = rayPt_y + coord1_max_scale * rayVect1_y;
+
+            // Get coord 2
+            var coord2_min_scale = getScalingForZDepth(rayPt_z, rayVect2_z, bb_min_z);
+            var coord2_min_x = rayPt_x + coord2_min_scale * rayVect2_x;
+            var coord2_min_y = rayPt_y + coord2_min_scale * rayVect2_y;
+            var coord2_max_scale = getScalingForZDepth(rayPt_z, rayVect2_z, bb_max_z);
+            var coord2_max_x = rayPt_x + coord2_max_scale * rayVect2_x;
+            var coord2_max_y = rayPt_y + coord2_max_scale * rayVect2_y;
+
+            // Get coord 3
+            var coord3_min_scale = getScalingForZDepth(rayPt_z, rayVect3_z, bb_min_z);
+            var coord3_min_x = rayPt_x + coord3_min_scale * rayVect3_x;
+            var coord3_min_y = rayPt_y + coord3_min_scale * rayVect3_y;
+            var coord3_max_scale = getScalingForZDepth(rayPt_z, rayVect3_z, bb_max_z);
+            var coord3_max_x = rayPt_x + coord3_max_scale * rayVect3_x;
+            var coord3_max_y = rayPt_y + coord3_max_scale * rayVect3_y;
+            // ======================================================================
+
+            var isOverlapping = checkOverlappingSquares(bb_min_x, bb_min_y, bb_max_x, bb_max_y, 
+                                                        coord0_min_x, coord0_min_y, coord0_max_x, coord0_max_y, 
+                                                        coord1_min_x, coord1_min_y, coord1_max_x, coord1_max_y, 
+                                                        coord2_min_x, coord2_min_y, coord2_max_x, coord2_max_y, 
+                                                        coord3_min_x, coord3_min_y, coord3_max_x, coord3_max_y);
+            
+            if (isOverlapping == 1){
+              return 1;
+            }
+          }
+
+          return 0;
+        }, opt);
+
+        return getActiveViewBoxesKernel;
+      }
+
+      mykernel = getActiveViewBoxes("gpu");
+      var vBoxes = mykernel(camera, bboxes);
+      var activeVBoxes = getActiveVBoxesCoord(vBoxes);
+
+      // get the pixels that intersect with bounding boxes
+      function findIntersectedBB(mode){
+        var opt = {
+          dimensions: [unitWidth, unitHeight],
+          debug: true,
+          graphical: false,
+          safeTextureReadHack: false,
+          constants: { OBJCOUNT: objects[0],
+                        WIDTH: width, HEIGHT: height, 
+                        INFINITY: 100000000,
+                        UNITWIDTH: unitWidth, UNITHEIGHT: unitHeight,    
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        // ObjTyp.SPHERE attributes
+        // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad, 
+        var findPixels = gpu.createKernel(function(camera, bboxes, vBox_x, vBox_y){
+          
+          var camera_x = camera[0];
+          var camera_y = camera[1];
+          var camera_z = camera[2];
+          var cameraVector_x = camera[3];
+          var cameraVector_y = camera[4];
+          var cameraVector_z = camera[5];
+          var cameraFov = camera[6];
+
+          // Eye vector
+          var eyeVector_x = cameraVector_x - camera_x;
+          var eyeVector_y = cameraVector_y - camera_y;
+          var eyeVector_z = cameraVector_z - camera_z;
+          var eyeVector_size = magVector(eyeVector_x, eyeVector_y, eyeVector_z);
+          eyeVector_x = eyeVector_x / eyeVector_size;
+          eyeVector_y = eyeVector_y / eyeVector_size;
+          eyeVector_z = eyeVector_z / eyeVector_size;
+
+          // Cross product
+          // x: (a.y * b.z) - (a.z * b.y)
+          // y: (a.z * b.x) - (a.x * b.z)
+          // z: (a.x * b.y) - (a.y * b.x)
+          var vpRight_x = eyeVector_y*0 - eyeVector_z*1;
+          var vpRight_y = eyeVector_z*0 - eyeVector_x*0;
+          var vpRight_z = eyeVector_x*1 - eyeVector_y*0;
+          var vpRight_size = magVector(vpRight_x, vpRight_y, vpRight_z);
+          vpRight_x = vpRight_x / vpRight_size;
+          vpRight_y = vpRight_y / vpRight_size;
+          vpRight_z = vpRight_z / vpRight_size;
+
+          var vpUp_x = vpRight_y*eyeVector_z - vpRight_z*eyeVector_y;
+          var vpUp_y = vpRight_z*eyeVector_x - vpRight_x*eyeVector_z;
+          var vpUp_z = vpRight_x*eyeVector_y - vpRight_y*eyeVector_x;
+          var vpUp_size = magVector(vpUp_x, vpUp_y, vpUp_z);
+          vpUp_x = vpUp_x / vpUp_size;
+          vpUp_y = vpUp_y / vpUp_size;
+          vpUp_z = vpUp_z / vpUp_size;
+
+          var fovRadians = 3.142 * (cameraFov / 2) / 180;
+          var heightWidthRatio = this.constants.HEIGHT / this.constants.WIDTH;
+          var halfWidth = Math.tan(fovRadians);
+          var halfHeight = heightWidthRatio * halfWidth;
+          var cameraWidth = halfWidth * 2;
+          var cameraHeight = halfHeight * 2;
+          var pixelWidth = cameraWidth / (this.constants.WIDTH - 1);
+          var pixelHeight = cameraHeight / (this.constants.HEIGHT - 1);
+
+          var pixel_x = getPixelCoord_x(vBox_x, this.thread.x, this.constants.UNITWIDTH);
+          var pixel_y = getPixelCoord_y(vBox_y, this.thread.y, this.constants.UNITHEIGHT);
+
+          var xcomp_scale = (pixel_x * pixelWidth) - halfWidth;
+          var xcomp_x = vpRight_x * xcomp_scale;
+          var xcomp_y = vpRight_y * xcomp_scale;
+          var xcomp_z = vpRight_z * xcomp_scale;
+
+          var ycomp_scale = (pixel_y * pixelHeight) - halfHeight;
+          var ycomp_x = vpUp_x * ycomp_scale;
+          var ycomp_y = vpUp_y * ycomp_scale;
+          var ycomp_z = vpUp_z * ycomp_scale;
+
+          var rayVect_x = eyeVector_x + xcomp_x + ycomp_x;
+          var rayVect_y = eyeVector_y + xcomp_y + ycomp_y;
+          var rayVect_z = eyeVector_z + xcomp_z + ycomp_z;
+          var rayVect_size = magVector(rayVect_x, rayVect_y, rayVect_z);
+          rayVect_x = rayVect_x / rayVect_size;
+          rayVect_y = rayVect_y / rayVect_size;
+          rayVect_z = rayVect_z / rayVect_size;
+
+          var rayPt_x = camera_x;
+          var rayPt_y = camera_y;
+          var rayPt_z = camera_z;
+
+          var idx = 1;                                   
+          var nextidx = 1;  
+          var idxInc = 6;
+          // for each bounding box                 
+          // min_x, min_y, min_z, max_x, max_y, max_z
+          for (i = 0; i < this.constants.OBJCOUNT; i++) {    
+            idx = nextidx;                               
+            nextidx = idx + idxInc;
+            var bb_min_x = bboxes[idx];
+            var bb_min_y = bboxes[idx + 1];
+            var bb_min_z = bboxes[idx + 2];
+            var bb_max_x = bboxes[idx + 3];
+            var bb_max_y = bboxes[idx + 4];
+            var bb_max_z = bboxes[idx + 5];
+
+            var isIntersect = intersectBB(rayPt_x, rayPt_y, rayPt_z, rayVect_x, rayVect_y, rayVect_z, bb_min_x, bb_min_y, bb_min_z, bb_max_x, bb_max_y, bb_max_z);
+            if (isIntersect == 1){
+              return colorRgbToInt(0.5, 0, 0);
+            }
+          }
+
+          return colorRgbToInt(0, 0, 0);
+        }, opt);
+        
+        return findPixels;
+      }
+
+      // initialize pixel color map
+      var pixelColorMap = [];
+      for (var i = 0; i < width; i++){
+        pixelColorMap[i] = [];
+        for (var j = 0; j < height; j++){
+          pixelColorMap[i][j] = 1000000000;
+          //pixelColorMap[i][j] = [0,0,0];
+        }
+      }
+
+      // get intersected bounding boxes
+      mykernel = findIntersectedBB("gpu"); 
+      var results = []; 
+      for (var i = 0; i < activeVBoxes.length; i++){
+        var vBox_x = activeVBoxes[i][0];
+        var vBox_y = activeVBoxes[i][1];
+        var result = mykernel(camera, bboxes, vBox_x, vBox_y);
+        results.push(result);
+        for (var w = 0; w < unitWidth; w++){
+          for (var h = 0; h < unitHeight; h++){
+            var pixel_x = getPixelCoord_x(vBox_x, w, unitWidth);
+            var pixel_y = getPixelCoord_y(vBox_y, h, unitHeight);
+            pixelColorMap[pixel_x][pixel_y] = result[h][w];
+            //pixelColorMap[pixel_x][pixel_y] = intToColorRgb(result[w][h]);
+          }
+        }
+      }
+
+      // draw out pixel color map
+      function drawPixelColorMap(mode){
+        var opt = {
+          dimensions: [width, height],
+          debug: true,
+          graphical: true,
+          safeTextureReadHack: false,
+          constants: { OBJCOUNT: objects[0],
+                        WIDTH: width, HEIGHT: height, 
+                        INFINITY: 100000000,
+                        UNITWIDTH: unitWidth, UNITHEIGHT: unitHeight,    
+                        EMPTY: ObjTyp.EMPTY,    SPHERE: ObjTyp.SPHERE,   CUBOID: ObjTyp.CUBOID, 
+                        CYLINDER: ObjTyp.CYLINDER,   CONE: ObjTyp.CONE,   TRIANGLE: ObjTyp.TRIANGLE },
+          mode: mode
+        };
+
+        // ObjTyp.SPHERE attributes
+        // typ,recsz,r,g,b,spec,lamb,amb,opac, x,y,z,rad, 
+        var drawPixelColorMapKernel = gpu.createKernel(function(pixelColorMap){
+          var colorR = getColorHueFromInt(pixelColorMap[this.thread.x][this.thread.y], 0) / 255;
+          var colorG = getColorHueFromInt(pixelColorMap[this.thread.x][this.thread.y], 1) / 255;
+          var colorB = getColorHueFromInt(pixelColorMap[this.thread.x][this.thread.y], 2) / 255;
+          this.color(colorR, colorG, colorB);
+          //return colorR;
+        }, opt);
+
+        return drawPixelColorMapKernel;
+      }
+
+      mykernel = drawPixelColorMap("gpu");
+      //var C = mykernel(pixelColorMap);
+
+
+      mykernel(pixelColorMap);
+      var canvas = mykernel.getCanvas();
+      document.getElementsByTagName('body')[0].appendChild(canvas);
+
+    </script>
+  </body>
+</html>
+
+
+
+
+
+
+
